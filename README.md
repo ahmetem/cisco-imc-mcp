@@ -12,7 +12,7 @@ Tested with a **HX220C-M4S** running IMC firmware **4.1(2m)**.
 
 ## Features
 
-Nine tools across two categories:
+Fourteen tools across three categories:
 
 ### Read-only (safe to call automatically)
 
@@ -21,7 +21,11 @@ Nine tools across two categories:
 | `imc_get_system_info` | Vendor, model, serial, CPUs, cores, total memory, BIOS POST state, IMC firmware version |
 | `imc_get_power_status` | Current operational power state (on/off) and BIOS POST state |
 | `imc_get_health` | Power supplies, fans, and CPU temperature sensor readings |
-| `imc_list_drives` | Physical drives reported by the storage controllers: slot, vendor, model, size, type, state |
+| `imc_get_psu_details` | Per-PSU model + operability **plus AC input (V/A/W) and DC output (V/A) stats** |
+| `imc_list_drives` | Physical drives: slot, vendor, model, size, type, state |
+| `imc_get_disk_smart` | Per-drive health & error counters: `pdStatus`, `predictiveFailureCount`, `mediaErrorCount`, `otherErrorCount`, `linkSpeed`. Optional `slot_id` for single-drive detail. |
+| `imc_get_memory_health` | Per-DIMM presence, capacity, speed, vendor, operability, operState across all `memoryArray` containers |
+| `imc_get_event_log` | System Event Log (SEL) entries (newest first). Optional `max_entries` (default 50) and `severity_filter` (substring match against `critical`/`warning`/`info`/etc.) |
 
 ### Power actions (require `confirm=true`)
 
@@ -33,11 +37,19 @@ Nine tools across two categories:
 | `imc_reboot` | Force restart, hard reset (`hard-reset-immediate`) |
 | `imc_power_cycle` | Power cycle: off then on (`cycle-immediate`) |
 
+### Destructive maintenance (require `confirm=true` AND `i_understand_data_loss=true`)
+
+| Tool | Description |
+|---|---|
+| `imc_clear_event_log` | Clear the System Event Log. Irreversible — all event history is permanently lost. Consider exporting via `imc_get_event_log` first. |
+
 ### Built-in safety
 
-All action tools require `confirm=true`. The agent must explicitly pass that
-flag — in practice this means Claude only fires these after the user clearly
-asks for the action. Read-only tools have no such guard.
+Action tools require `confirm=true`. Destructive tools that erase persistent
+state (right now only `imc_clear_event_log`) additionally require
+`i_understand_data_loss=true`. The agent must explicitly pass both flags —
+in practice this means Claude only fires these after the user clearly asks
+for the action. Read-only tools have no such guard.
 
 ## Requirements
 
@@ -183,6 +195,35 @@ with `confirm=true`.
 
 Claude calls `imc_get_health` and `imc_get_power_status`.
 
+**Investigate the PSU 1 warning:**
+
+> "Show me detailed PSU info, including input voltage."
+
+Claude calls `imc_get_psu_details` and reports input V/A/W and the current
+operability state of each PSU.
+
+**Drill into a flaky drive:**
+
+> "Show me the SMART counters for slot 3."
+
+Claude calls `imc_get_disk_smart` with `slot_id="3"` and returns
+`pdStatus`, `predictiveFailureCount`, `mediaErrorCount`, `otherErrorCount`
+plus the full attribute dump.
+
+**Check for ECC memory errors:**
+
+> "Are any DIMMs degraded?"
+
+Claude calls `imc_get_memory_health` and surfaces any slot whose
+operability or operState isn't `operable`/`ok`.
+
+**Investigate an intermittent fault:**
+
+> "Show me the last 20 critical entries in the system event log."
+
+Claude calls `imc_get_event_log` with `max_entries=20,
+severity_filter="critical"`.
+
 **Power cycle a stuck server:**
 
 > "The Cisco server is hung. Power cycle it."
@@ -194,6 +235,14 @@ Claude calls `imc_power_cycle` with `confirm=true` after confirmation.
 > "How many drives are in the Cisco box and what's their state?"
 
 Claude calls `imc_list_drives`.
+
+**Clear a near-full SEL (only after exporting):**
+
+> "Export the SEL to me, then clear it."
+
+Claude first calls `imc_get_event_log` with the full retention, then asks
+for explicit `i_understand_data_loss=true` confirmation, then calls
+`imc_clear_event_log`.
 
 ## Configuration reference
 
@@ -252,9 +301,17 @@ For power actions, the server writes `adminPower` on the
 
 - **"Resource not found"** or empty results
   Very old IMC firmware may use different class IDs. The MOs this server
-  reads — `computeRackUnit`, `equipmentPsu`, `equipmentFan`,
-  `processorEnvStats`, `storageLocalDisk` — have been stable since IMC 2.x,
-  but rare variants exist.
+  reads — `computeRackUnit`, `equipmentPsu`, `equipmentPsuInputStats`,
+  `equipmentPsuOutputStats`, `equipmentFan`, `processorEnvStats`,
+  `storageLocalDisk`, `memoryArray`, `memoryUnit`, `sysdebugMEpLogEntry` —
+  have been stable since IMC 2.x, but rare variants exist.
+
+- **`imc_clear_event_log` returns an XML API error.**
+  The exact class for the SEL clear action varies slightly between IMC
+  versions. This server uses `sysdebugMEpLog` with `adminState="clear"`
+  at DN `sys/rack-unit-1/mgmt/log-SEL`. If your IMC reports an error, the
+  description usually names the right alternative (commonly
+  `adminAction="clear-log"`).
 
 - **Power state doesn't change immediately after an action.**
   Normal. Cisco hardware takes 30–90 seconds for power transitions to

@@ -212,6 +212,80 @@ def _missing_confirm_error(action: str) -> str:
     )
 
 
+def _missing_data_loss_error(action: str) -> str:
+    return (
+        f"Refused: '{action}' is destructive and requires "
+        "i_understand_data_loss=true in addition to confirm=true. "
+        "Explain the consequences to the user and ask explicitly."
+    )
+
+
+class DiskSmartInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    slot_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional drive slot ID (e.g. '1', '2'). If omitted, returns "
+            "health/error counters for every drive reported by the storage "
+            "controller."
+        ),
+        max_length=8,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' or 'json'.",
+    )
+
+
+class EventLogInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    max_entries: int = Field(
+        default=50,
+        description="Maximum number of entries to return (most recent first).",
+        ge=1,
+        le=1000,
+    )
+    severity_filter: Optional[str] = Field(
+        default=None,
+        description=(
+            "Only return entries with this severity (case-insensitive substring "
+            "match against the entry's severity field, e.g. 'critical', "
+            "'warning', 'info')."
+        ),
+        max_length=32,
+        pattern=r"^[A-Za-z_-]+$",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' or 'json'.",
+    )
+
+
+class ClearLogInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Must be true to execute. Only set after the user has explicitly "
+            "asked to clear the SEL."
+        ),
+    )
+    i_understand_data_loss: bool = Field(
+        default=False,
+        description=(
+            "Must be true. Clearing the SEL is irreversible \u2014 all event "
+            "history (hardware fault events, BIOS messages, etc.) is "
+            "permanently lost."
+        ),
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="Optional short note about why the SEL is being cleared.",
+        max_length=200,
+    )
+
+
 def _attrs(el: ET.Element) -> dict[str, str]:
     return dict(el.attrib)
 
@@ -555,10 +629,395 @@ async def imc_power_cycle(params: ConfirmInput) -> str:
     return await _set_admin_power("cycle-immediate")
 
 
+
+@mcp.tool(
+    name="imc_get_psu_details",
+    annotations={
+        "title": "Get PSU Details (Input/Output Stats)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def imc_get_psu_details(params: FormatInput) -> str:
+    """Get detailed PSU information including input voltage, output, and operability.
+
+    Combines equipmentPsu (inventory + operability) with equipmentPsuInputStats
+    (AC input voltage / current / power) and equipmentPsuOutputStats (DC output
+    voltage). Useful for confirming the PSU 1 warning seen historically on
+    this server and for tracking input power draw.
+
+    Returns:
+        str: Per-PSU details in markdown or JSON.
+    """
+    cfg_err = _require_config()
+    if cfg_err:
+        return cfg_err
+    try:
+        async with _imc_session() as (client, cookie):
+            psus = await _resolve_class(client, cookie, "equipmentPsu")
+            in_stats = await _resolve_class(client, cookie, "equipmentPsuInputStats")
+            out_stats = await _resolve_class(client, cookie, "equipmentPsuOutputStats")
+    except Exception as exc:
+        return _format_http_error(exc)
+
+    # Index stats by parent DN (strip the trailing /input-stats or /output-stats)
+    def _parent_dn(el: ET.Element) -> str:
+        d = el.attrib.get("dn", "")
+        return d.rsplit("/", 1)[0] if "/" in d else d
+
+    in_by_parent = {_parent_dn(s): _attrs(s) for s in in_stats}
+    out_by_parent = {_parent_dn(s): _attrs(s) for s in out_stats}
+
+    if params.response_format == ResponseFormat.JSON:
+        merged = []
+        for p in psus:
+            pa = _attrs(p)
+            dn = pa.get("dn", "")
+            merged.append({
+                "psu": pa,
+                "input": in_by_parent.get(dn, {}),
+                "output": out_by_parent.get(dn, {}),
+            })
+        return _to_json(merged)
+
+    if not psus:
+        return "_No PSUs reported by IMC (server may be powered off)._"
+
+    lines = ["## Power Supply Details", ""]
+    for p in psus:
+        a = p.attrib
+        dn = a.get("dn", "")
+        i = in_by_parent.get(dn, {})
+        o = out_by_parent.get(dn, {})
+        lines.append(f"### PSU {a.get('id', '?')}")
+        lines.append(f"- **Model**: {a.get('model', '?')}")
+        if a.get("vendor"):
+            lines.append(f"- **Vendor**: {a.get('vendor')}")
+        if a.get("serial"):
+            lines.append(f"- **Serial**: {a.get('serial')}")
+        lines.append(f"- **Operability**: {a.get('operability', '?')}")
+        if a.get("voltage"):
+            lines.append(f"- **Voltage source**: {a.get('voltage')}")
+        if a.get("power"):
+            lines.append(f"- **Power state**: {a.get('power')}")
+        if a.get("thermal"):
+            lines.append(f"- **Thermal**: {a.get('thermal')}")
+        if i:
+            iv = i.get("voltage") or i.get("current") or i.get("power")
+            if iv is not None:
+                bits = []
+                if i.get("voltage"):
+                    bits.append(f"V={i.get('voltage')}V")
+                if i.get("current"):
+                    bits.append(f"I={i.get('current')}A")
+                if i.get("power"):
+                    bits.append(f"P={i.get('power')}W")
+                lines.append(f"- **Input**: {', '.join(bits)}")
+        if o:
+            bits = []
+            if o.get("voltage"):
+                bits.append(f"V={o.get('voltage')}V")
+            if o.get("current"):
+                bits.append(f"I={o.get('current')}A")
+            if bits:
+                lines.append(f"- **Output**: {', '.join(bits)}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+
+@mcp.tool(
+    name="imc_get_disk_smart",
+    annotations={
+        "title": "Get Disk Health / Error Counters",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def imc_get_disk_smart(params: DiskSmartInput) -> str:
+    """Get physical drive health and error counters from the storage controller.
+
+    Cisco IMC does not expose full ATA/NVMe SMART attribute tables \u2014 but it
+    does report the counters that matter for early failure detection:
+    pdStatus, predictiveFailureCount, mediaErrorCount, otherErrorCount, and
+    linkSpeed. Use slot_id to focus on a single drive.
+
+    Returns:
+        str: Per-drive health summary in markdown or JSON.
+    """
+    cfg_err = _require_config()
+    if cfg_err:
+        return cfg_err
+    try:
+        async with _imc_session() as (client, cookie):
+            drives = await _resolve_class(client, cookie, "storageLocalDisk")
+    except Exception as exc:
+        return _format_http_error(exc)
+
+    if params.slot_id:
+        drives = [d for d in drives if d.attrib.get("id") == params.slot_id]
+        if not drives:
+            return f"_No drive in slot '{params.slot_id}' reported by IMC._"
+
+    if params.response_format == ResponseFormat.JSON:
+        return _to_json([_attrs(d) for d in drives])
+
+    if not drives:
+        return "_No drives reported by IMC._"
+
+    lines = ["## Drive Health", ""]
+    lines.append(
+        "| Slot | Vendor / Model | Size | Type | Status | "
+        "PredFail | MediaErr | OtherErr | LinkSpeed |"
+    )
+    lines.append(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    )
+    for d in drives:
+        a = d.attrib
+        size_mb = a.get("coercedSize") or a.get("rawSize")
+        try:
+            size = f"{int(size_mb) / 1024:.0f} GB" if size_mb else "?"
+        except (ValueError, TypeError):
+            size = f"{size_mb} MB"
+        vm = f"{a.get('vendor', '?')} {a.get('productId') or a.get('productName', '?')}"
+        status = a.get("pdStatus") or a.get("driveState") or "?"
+        lines.append(
+            f"| {a.get('id', '?')} | {vm} | {size} | "
+            f"{a.get('mediaType', '?')} | {status} | "
+            f"{a.get('predictiveFailureCount', '0')} | "
+            f"{a.get('mediaErrorCount', '0')} | "
+            f"{a.get('otherErrorCount', '0')} | "
+            f"{a.get('linkSpeed', '?')} |"
+        )
+
+    if params.slot_id and drives:
+        a = drives[0].attrib
+        lines.append("")
+        lines.append(f"### Slot {a.get('id')} full attributes")
+        for k in sorted(a.keys()):
+            v = a[k]
+            if k == "dn" or v in (None, ""):
+                continue
+            lines.append(f"- **{k}**: {v}")
+    return "\n".join(lines)
+
+
+
+@mcp.tool(
+    name="imc_get_memory_health",
+    annotations={
+        "title": "Get DIMM Health (per slot)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def imc_get_memory_health(params: FormatInput) -> str:
+    """Get per-DIMM health, capacity, speed, vendor, and presence.
+
+    Walks the `memoryArray` containers and lists every `memoryUnit` (DIMM
+    slot) with its operability and operState. Empty slots are listed too,
+    so the layout of populated vs unpopulated channels is visible.
+
+    Returns:
+        str: Per-DIMM health summary in markdown or JSON.
+    """
+    cfg_err = _require_config()
+    if cfg_err:
+        return cfg_err
+    try:
+        async with _imc_session() as (client, cookie):
+            arrays = await _resolve_class(client, cookie, "memoryArray")
+            units = await _resolve_class(client, cookie, "memoryUnit")
+    except Exception as exc:
+        return _format_http_error(exc)
+
+    if params.response_format == ResponseFormat.JSON:
+        return _to_json({
+            "arrays": [_attrs(a) for a in arrays],
+            "units": [_attrs(u) for u in units],
+        })
+
+    if not units:
+        return "_No memory units reported by IMC (server may be powered off)._"
+
+    lines = ["## DIMM Health", ""]
+    if arrays:
+        for ar in arrays:
+            a = ar.attrib
+            populated = a.get("populated") or a.get("currNumberOfDevices")
+            total_slots = a.get("numberOfDevices")
+            if populated or total_slots:
+                lines.append(
+                    f"- **Array {a.get('id', '?')}**: "
+                    f"{populated or '?'} of {total_slots or '?'} slots populated, "
+                    f"total {a.get('currCapacity', a.get('capacity', '?'))} MB"
+                )
+        lines.append("")
+
+    lines.append(
+        "| Slot | Present | Capacity | Speed | Vendor | "
+        "Model | Operability | OperState |"
+    )
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    for u in sorted(units, key=lambda x: x.attrib.get("dn", "")):
+        a = u.attrib
+        cap = a.get("capacity")
+        try:
+            cap_str = f"{int(cap) / 1024:.0f} GB" if cap and cap != "0" else "-"
+        except (ValueError, TypeError):
+            cap_str = f"{cap} MB"
+        present = a.get("presence", "?")
+        lines.append(
+            f"| {a.get('id', a.get('location', '?'))} | "
+            f"{present} | {cap_str} | "
+            f"{a.get('clock', '-')} MHz | "
+            f"{a.get('vendor', '-')} | "
+            f"{a.get('model', '-')} | "
+            f"{a.get('operability', '-')} | "
+            f"{a.get('operState', '-')} |"
+        )
+    return "\n".join(lines)
+
+
+
+@mcp.tool(
+    name="imc_get_event_log",
+    annotations={
+        "title": "Read System Event Log (SEL)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def imc_get_event_log(params: EventLogInput) -> str:
+    """Read entries from the System Event Log (SEL).
+
+    Returns the most recent entries (up to max_entries, default 50). The SEL
+    is where the IMC records hardware fault events, BIOS messages, sensor
+    threshold crossings, and similar. Use this when investigating
+    intermittent issues or after a hardware warning.
+
+    Returns:
+        str: SEL entries (newest first) in markdown or JSON.
+    """
+    cfg_err = _require_config()
+    if cfg_err:
+        return cfg_err
+    try:
+        async with _imc_session() as (client, cookie):
+            entries = await _resolve_class(client, cookie, "sysdebugMEpLogEntry")
+    except Exception as exc:
+        return _format_http_error(exc)
+
+    # Sort newest first (by id if numeric, else by timestamp)
+    def _sort_key(e: ET.Element) -> tuple:
+        a = e.attrib
+        rid = a.get("id", "0")
+        try:
+            return (1, -int(rid))
+        except (ValueError, TypeError):
+            return (0, a.get("timestamp", ""))
+
+    entries.sort(key=_sort_key)
+
+    if params.severity_filter:
+        sev = params.severity_filter.lower()
+        entries = [
+            e for e in entries
+            if sev in (e.attrib.get("severity") or "").lower()
+        ]
+
+    entries = entries[: params.max_entries]
+
+    if params.response_format == ResponseFormat.JSON:
+        return _to_json([_attrs(e) for e in entries])
+
+    if not entries:
+        msg = "_No SEL entries"
+        if params.severity_filter:
+            msg += f" matching severity '{params.severity_filter}'"
+        msg += "._"
+        return msg
+
+    lines = [f"## System Event Log ({len(entries)} entries)", ""]
+    lines.append("| ID | Time | Severity | Description |")
+    lines.append("| --- | --- | --- | --- |")
+    for e in entries:
+        a = e.attrib
+        desc = (a.get("description") or "").replace("|", "\\|")
+        lines.append(
+            f"| {a.get('id', '?')} | "
+            f"{a.get('timestamp', '?')} | "
+            f"{a.get('severity', '?')} | "
+            f"{desc} |"
+        )
+    return "\n".join(lines)
+
+
+
+@mcp.tool(
+    name="imc_clear_event_log",
+    annotations={
+        "title": "Clear System Event Log (DESTRUCTIVE)",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def imc_clear_event_log(params: ClearLogInput) -> str:
+    """Clear the entire System Event Log.
+
+    Requires BOTH confirm=true AND i_understand_data_loss=true.
+
+    Clearing the SEL is irreversible \u2014 the full event history (hardware
+    fault events, BIOS messages, sensor threshold crossings) is permanently
+    lost. Useful when the SEL is near full and you want a fresh starting
+    point, but consider exporting the SEL first via imc_get_event_log.
+    """
+    cfg_err = _require_config()
+    if cfg_err:
+        return cfg_err
+    if not params.confirm:
+        return _missing_confirm_error("imc_clear_event_log")
+    if not params.i_understand_data_loss:
+        return _missing_data_loss_error("imc_clear_event_log")
+
+    log_dn = f"{RACK_DN}/mgmt/log-SEL"
+    try:
+        async with _imc_session() as (client, cookie):
+            await _conf_mo(
+                client, cookie, log_dn, "sysdebugMEpLog",
+                {"adminState": "clear"},
+            )
+    except Exception as exc:
+        return _format_http_error(exc)
+
+    return (
+        f"OK: SEL cleared on {log_dn}. "
+        "Use imc_get_event_log to confirm (should now be empty)."
+    )
+
+
 TOOLS = [
+    # Inventory and status
     "imc_get_system_info", "imc_get_power_status", "imc_get_health",
-    "imc_list_drives", "imc_power_on", "imc_power_off_graceful",
+    "imc_list_drives",
+    # Power actions
+    "imc_power_on", "imc_power_off_graceful",
     "imc_power_off_force", "imc_reboot", "imc_power_cycle",
+    # Detailed health (new)
+    "imc_get_psu_details", "imc_get_disk_smart", "imc_get_memory_health",
+    # System Event Log (new)
+    "imc_get_event_log", "imc_clear_event_log",
 ]
 
 
