@@ -12,7 +12,7 @@ sunucusu. Bu API tüm IMC firmware sürümlerinde (2.x, 3.x, 4.x) desteklenir.
 
 ## Özellikler
 
-Üç kategoride on dört araç:
+Üç kategoride on üç araç:
 
 ### Salt-okunur (otomatik çağrı güvenli)
 
@@ -21,11 +21,11 @@ sunucusu. Bu API tüm IMC firmware sürümlerinde (2.x, 3.x, 4.x) desteklenir.
 | `imc_get_system_info` | Vendor, model, seri no, CPU/çekirdek, toplam RAM, BIOS POST durumu, IMC firmware sürümü |
 | `imc_get_power_status` | Mevcut operasyonel güç durumu (on/off) ve BIOS POST durumu |
 | `imc_get_health` | Güç kaynakları, fanlar, CPU sıcaklık sensörleri |
-| `imc_get_psu_details` | PSU başına model + operability **artı AC girişi (V/A/W) ve DC çıkışı (V/A) istatistikleri** |
+| `imc_get_psu_details` | PSU başına model, vendor, firmware, operability **artı input range, output voltage, max output** (doğrudan `equipmentPsu` native attribute'larından okunur) |
 | `imc_list_drives` | Fiziksel diskler: slot, vendor, model, kapasite, tip, durum |
 | `imc_get_disk_smart` | Disk başına sağlık ve hata sayaçları: `pdStatus`, `predictiveFailureCount`, `mediaErrorCount`, `otherErrorCount`, `linkSpeed`. Tek disk detayı için opsiyonel `slot_id`. |
 | `imc_get_memory_health` | Tüm `memoryArray` container'ları boyunca DIMM başına presence, kapasite, hız, vendor, operability, operState |
-| `imc_get_event_log` | System Event Log (SEL) entry'leri (en yeniden en eskiye). Opsiyonel `max_entries` (varsayılan 50) ve `severity_filter` (`critical`/`warning`/`info`/vb. üzerine substring eşleşmesi) |
+| `imc_get_faults` | IMC'deki aktif fault instance'ları (`faultInst` MO) — XML API'de "Chassis → Faults" karşılığı. Opsiyonel `max_entries` (varsayılan 50) ve `severity_filter` (`critical`/`major`/`minor`/`warning`/`info`/`cleared`/`condition`). **SEL değil**; SEL Redfish API gerektirir ve bu sunucu henüz onu desteklemiyor. |
 
 ### Güç eylemleri (`confirm=true` gerektirir)
 
@@ -37,20 +37,17 @@ sunucusu. Bu API tüm IMC firmware sürümlerinde (2.x, 3.x, 4.x) desteklenir.
 | `imc_reboot` | Zorla yeniden başlatma, hard reset (`hard-reset-immediate`) |
 | `imc_power_cycle` | Güç çevrimi: önce kapat sonra aç (`cycle-immediate`) |
 
-### Yıkıcı bakım (`confirm=true` VE `i_understand_data_loss=true` gerektirir)
-
-| Araç | Açıklama |
-|---|---|
-| `imc_clear_event_log` | System Event Log'u temizler. Geri dönülemez — tüm event geçmişi kalıcı olarak kaybolur. Önce `imc_get_event_log` ile dışa aktarmayı düşün. |
-
 ### Güvenlik
 
-Eylem araçları `confirm=true` gerektirir. Kalıcı state silen yıkıcı
-araçlar (şu an yalnızca `imc_clear_event_log`) ek olarak
-`i_understand_data_loss=true` gerektirir. Ajan iki bayrağı da açıkça
+Eylem araçları `confirm=true` gerektirir. Ajan bu bayrağı açıkça
 geçmek zorundadır — pratikte bu, Claude'un bu araçları yalnızca kullanıcı
 eylemi açıkça istediğinde çağırması anlamına gelir. Salt-okunur araçlarda
 böyle bir koruma yoktur.
+
+`i_understand_data_loss=true` ikinci-bayrak deseni, ileride SEL'i
+temizleyecek bir araç için saklı tutuluyor. Şu an bu MCP SEL'e yazamıyor
+çünkü o işlem yalnızca Redfish API üzerinden çalışıyor, ve Redfish
+desteği henüz eklenmedi.
 
 ## Gereksinimler
 
@@ -221,12 +218,12 @@ attribute dump'ını döner.
 Claude `imc_get_memory_health`'ı çağırır; operability/operState değeri
 `operable`/`ok` olmayan slotları öne çıkarır.
 
-**Aralıklı bir arızayı araştır:**
+**Aktif donanım fault'larını araştır:**
 
-> "Sistem event log'undaki son 20 critical kaydı göster."
+> "Cisco sunucuda şu an aktif olan donanım fault'ları neler?"
 
-Claude `imc_get_event_log`'u `max_entries=20, severity_filter="critical"`
-ile çağırır.
+Claude `imc_get_faults`'u çağırır ve her aktif `faultInst`'ı severity,
+kod, son geçiş zamanı ve insan-okunur açıklamasıyla listeler.
 
 **Takılı sunucuyu power-cycle et:**
 
@@ -239,14 +236,6 @@ Onaydan sonra Claude `imc_power_cycle`'ı `confirm=true` ile çağırır.
 > "Cisco kutusunda kaç disk var ve durumları ne?"
 
 Claude `imc_list_drives`'ı çağırır.
-
-**Dolan SEL'i temizle (önce dışa aktarma sonrası):**
-
-> "SEL'i bana ver, sonra temizle."
-
-Claude önce `imc_get_event_log`'u tam retention ile çağırır, sonra açık
-`i_understand_data_loss=true` onayı ister, sonra `imc_clear_event_log`'u
-çağırır.
 
 ## Yapılandırma referansı
 
@@ -308,16 +297,9 @@ Güç eylemleri için sunucu, `computeRackUnit` nesnesi üzerinde `adminPower`
 - **"Resource not found"** veya boş sonuçlar
   Çok eski IMC firmware'leri farklı class ID'leri kullanabilir. Bu
   sunucunun okuduğu MO'lar — `computeRackUnit`, `equipmentPsu`,
-  `equipmentPsuInputStats`, `equipmentPsuOutputStats`, `equipmentFan`,
-  `processorEnvStats`, `storageLocalDisk`, `memoryArray`, `memoryUnit`,
-  `sysdebugMEpLogEntry` — IMC 2.x'ten beri stabildir ama nadir varyantlar
-  olabilir.
-
-- **`imc_clear_event_log` XML API hatası dönüyor.**
-  SEL temizleme için kesin class IMC sürümleri arasında biraz değişir. Bu
-  sunucu `sys/rack-unit-1/mgmt/log-SEL` DN'inde `sysdebugMEpLog` üzerinde
-  `adminState="clear"` kullanır. IMC'in hata dönerse, açıklama genellikle
-  doğru alternatifi söyler (sıklıkla `adminAction="clear-log"`).
+  `equipmentFan`, `processorEnvStats`, `storageLocalDisk`, `memoryArray`,
+  `memoryUnit`, `faultInst` — IMC 2.x'ten beri stabildir ama nadir
+  varyantlar olabilir.
 
 - **Eylemden hemen sonra güç durumu değişmiyor.**
   Normal. Cisco donanımı güç geçişlerinin oturması için 30-90 saniye
