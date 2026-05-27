@@ -238,20 +238,20 @@ class DiskSmartInput(BaseModel):
     )
 
 
-class EventLogInput(BaseModel):
+class FaultsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     max_entries: int = Field(
         default=50,
-        description="Maximum number of entries to return (most recent first).",
+        description="Maximum number of faults to return (most recent first).",
         ge=1,
         le=1000,
     )
     severity_filter: Optional[str] = Field(
         default=None,
         description=(
-            "Only return entries with this severity (case-insensitive substring "
-            "match against the entry's severity field, e.g. 'critical', "
-            "'warning', 'info')."
+            "Only return faults with this severity (case-insensitive substring "
+            "match against the fault's severity field, e.g. 'critical', "
+            "'major', 'minor', 'warning', 'info', 'cleared', 'condition')."
         ),
         max_length=32,
         pattern=r"^[A-Za-z_-]+$",
@@ -259,30 +259,6 @@ class EventLogInput(BaseModel):
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
         description="Output format: 'markdown' or 'json'.",
-    )
-
-
-class ClearLogInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    confirm: bool = Field(
-        default=False,
-        description=(
-            "Must be true to execute. Only set after the user has explicitly "
-            "asked to clear the SEL."
-        ),
-    )
-    i_understand_data_loss: bool = Field(
-        default=False,
-        description=(
-            "Must be true. Clearing the SEL is irreversible \u2014 all event "
-            "history (hardware fault events, BIOS messages, etc.) is "
-            "permanently lost."
-        ),
-    )
-    reason: Optional[str] = Field(
-        default=None,
-        description="Optional short note about why the SEL is being cleared.",
-        max_length=200,
     )
 
 
@@ -861,123 +837,87 @@ async def imc_get_memory_health(params: FormatInput) -> str:
 
 
 @mcp.tool(
-    name="imc_get_event_log",
+    name="imc_get_faults",
     annotations={
-        "title": "Read System Event Log (SEL)",
+        "title": "List Active Faults",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
     },
 )
-async def imc_get_event_log(params: EventLogInput) -> str:
-    """Read entries from the System Event Log (SEL).
+async def imc_get_faults(params: FaultsInput) -> str:
+    """List active fault instances reported by the IMC.
 
-    Returns the most recent entries (up to max_entries, default 50). The SEL
-    is where the IMC records hardware fault events, BIOS messages, sensor
-    threshold crossings, and similar. Use this when investigating
-    intermittent issues or after a hardware warning.
+    Returns the IMC's structured view of currently outstanding problems
+    (hardware, environmental, configuration, FSM, ...). This is the XML
+    API equivalent of "Chassis -> Faults" / "Fault Summary" in the IMC
+    web UI, backed by the faultInst MO class.
+
+    Note: this is NOT the System Event Log (SEL). The SEL is a separate
+    NVRAM-backed event ring whose entries are not exposed as managed
+    objects in the Cisco IMC XML schema (an earlier version of this
+    tool incorrectly tried to query a sysdebugMEpLogEntry class that
+    does not exist). Reading the SEL requires the Redfish API
+    (/redfish/v1/.../LogServices/SEL/Entries), which this MCP does not
+    yet support. For currently active hardware / environmental issues,
+    faultInst is the correct place to look.
 
     Returns:
-        str: SEL entries (newest first) in markdown or JSON.
+        str: Active faults (newest first) in markdown or JSON.
     """
     cfg_err = _require_config()
     if cfg_err:
         return cfg_err
     try:
         async with _imc_session() as (client, cookie):
-            entries = await _resolve_class(client, cookie, "sysdebugMEpLogEntry")
+            faults = await _resolve_class(client, cookie, "faultInst")
     except Exception as exc:
         return _format_http_error(exc)
 
-    # Sort newest first (by id if numeric, else by timestamp)
+    # Newest first: prefer lastTransition, then created, then id.
     def _sort_key(e: ET.Element) -> tuple:
         a = e.attrib
-        rid = a.get("id", "0")
-        try:
-            return (1, -int(rid))
-        except (ValueError, TypeError):
-            return (0, a.get("timestamp", ""))
+        return (
+            a.get("lastTransition", ""),
+            a.get("created", ""),
+            a.get("id", ""),
+        )
 
-    entries.sort(key=_sort_key)
+    faults.sort(key=_sort_key, reverse=True)
 
     if params.severity_filter:
         sev = params.severity_filter.lower()
-        entries = [
-            e for e in entries
+        faults = [
+            e for e in faults
             if sev in (e.attrib.get("severity") or "").lower()
         ]
 
-    entries = entries[: params.max_entries]
+    faults = faults[: params.max_entries]
 
     if params.response_format == ResponseFormat.JSON:
-        return _to_json([_attrs(e) for e in entries])
+        return _to_json([_attrs(e) for e in faults])
 
-    if not entries:
-        msg = "_No SEL entries"
+    if not faults:
+        msg = "_No active faults"
         if params.severity_filter:
             msg += f" matching severity '{params.severity_filter}'"
         msg += "._"
         return msg
 
-    lines = [f"## System Event Log ({len(entries)} entries)", ""]
-    lines.append("| ID | Time | Severity | Description |")
+    lines = [f"## Active Faults ({len(faults)} total)", ""]
+    lines.append("| Severity | Last Transition | Code | Description |")
     lines.append("| --- | --- | --- | --- |")
-    for e in entries:
+    for e in faults:
         a = e.attrib
-        desc = (a.get("description") or "").replace("|", "\\|")
+        desc = (a.get("descr") or "").replace("|", "\\|")
         lines.append(
-            f"| {a.get('id', '?')} | "
-            f"{a.get('timestamp', '?')} | "
-            f"{a.get('severity', '?')} | "
+            f"| {a.get('severity', '?')} | "
+            f"{a.get('lastTransition', '?')} | "
+            f"{a.get('code', '?')} | "
             f"{desc} |"
         )
     return "\n".join(lines)
-
-
-
-@mcp.tool(
-    name="imc_clear_event_log",
-    annotations={
-        "title": "Clear System Event Log (DESTRUCTIVE)",
-        "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def imc_clear_event_log(params: ClearLogInput) -> str:
-    """Clear the entire System Event Log.
-
-    Requires BOTH confirm=true AND i_understand_data_loss=true.
-
-    Clearing the SEL is irreversible \u2014 the full event history (hardware
-    fault events, BIOS messages, sensor threshold crossings) is permanently
-    lost. Useful when the SEL is near full and you want a fresh starting
-    point, but consider exporting the SEL first via imc_get_event_log.
-    """
-    cfg_err = _require_config()
-    if cfg_err:
-        return cfg_err
-    if not params.confirm:
-        return _missing_confirm_error("imc_clear_event_log")
-    if not params.i_understand_data_loss:
-        return _missing_data_loss_error("imc_clear_event_log")
-
-    log_dn = f"{RACK_DN}/mgmt/log-SEL"
-    try:
-        async with _imc_session() as (client, cookie):
-            await _conf_mo(
-                client, cookie, log_dn, "sysdebugMEpLog",
-                {"adminState": "clear"},
-            )
-    except Exception as exc:
-        return _format_http_error(exc)
-
-    return (
-        f"OK: SEL cleared on {log_dn}. "
-        "Use imc_get_event_log to confirm (should now be empty)."
-    )
 
 
 TOOLS = [
@@ -987,10 +927,10 @@ TOOLS = [
     # Power actions
     "imc_power_on", "imc_power_off_graceful",
     "imc_power_off_force", "imc_reboot", "imc_power_cycle",
-    # Detailed health (new)
+    # Detailed health
     "imc_get_psu_details", "imc_get_disk_smart", "imc_get_memory_health",
-    # System Event Log (new)
-    "imc_get_event_log", "imc_clear_event_log",
+    # Faults
+    "imc_get_faults",
 ]
 
 
